@@ -1,4 +1,4 @@
-import torch 
+import torch
 import torch.nn as nn 
 from torch.nn import functional as F
 
@@ -8,11 +8,10 @@ batch_size = 32
 block_size = 8
 max_iters = 3000
 eval_interval = 300 
-learning_rate = 1e-2
+learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embed = 32
-
 torch.manual_seed(1337)
 
 #wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
@@ -65,6 +64,51 @@ def estimate_loss():
     model.train()
     return out #resets back to training mode
 
+#single attention head:
+class Head (nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embed, head_size, bias=False)
+        self.query = nn.Linear(n_embed, head_size, bias=False)
+        self.value = nn.Linear(n_embed, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self, x):
+            B, T, C = x.shape
+            k = self.key(x)
+            q = self.query(x)
+            #compute attention scores
+            wei = q @ k.transpose(-2, -1) * C**-0.5 #(B, T, C) x (B, C, T) -> (B, T, T)
+            wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+            wei = F.softmax(wei, dim=-1)
+
+            v = self.value(x) #(B, T, C)
+            out = wei @ v #(B, T, T) x (B, T, C) -> (B, T, C)
+            return out
+
+#multi head attention in parallel:
+class MultipleHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+
+    def forward(self, x):
+        return torch.cat([h(x) for h in self.heads], dim=-1)
+
+#feeding each token embedding into a non linear layer for the models better understanding of each tokens relationships
+class Feed(nn.Module):
+    def __init__(self, n_embed):
+        super().__init__()
+        self.net = nn.Sequential( ##sequential block to run operations in specific order
+            nn.Linear(n_embed, n_embed),
+            nn.ReLU(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+
 
 class BigramLanguageModel(nn.Module):
 
@@ -72,6 +116,8 @@ class BigramLanguageModel(nn.Module):
     super().__init__()
     self.token_embedding_table = nn.Embedding(vocab_size, n_embed) #creates an embedding table full of raw scores correlating to the probability of a word. Each row is a word that has a corresponding vector to it
     self.position_embedding_table = nn.Embedding(block_size, n_embed)
+    self.attention_head = MultipleHeadAttention(4, n_embed//4) #we have 4 heads of 8 dimensional self attention
+    self.ff = Feed(n_embed)
     self.lm_head = nn.Linear(n_embed, vocab_size)
 
   def forward(self, idx, targets=None):
@@ -81,6 +127,7 @@ class BigramLanguageModel(nn.Module):
       token_emb = self.token_embedding_table(idx) #logits will correlate to the vector at the idx
       pos_emb = self.position_embedding_table(torch.arange(T, device=device)) #(T, C)
       x = token_emb + pos_emb
+      x = self.attention_head(x) #apply one head of self attention
       logits = self.lm_head(x) #(B, T, vocab_size)
 
       if targets is None:
@@ -98,7 +145,8 @@ class BigramLanguageModel(nn.Module):
   def generate(self, idx, max_new_tokens):
     for _ in range(max_new_tokens):
       #get the predictions
-      logits, loss = self(idx)
+      idx_crop = idx[:, -block_size:] #crops idx so that it fits the block size
+      logits, loss = self(idx_crop)
       logits = logits[:, -1, :]
       probs = F.softmax(logits, dim=-1)
       #sample from the distribution
