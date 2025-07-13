@@ -1,17 +1,21 @@
 import torch
 import torch.nn as nn 
 from torch.nn import functional as F
+from torch.nn.functional import dropout
 
 print(torch.__version__)
 
-batch_size = 32 
-block_size = 8
-max_iters = 3000
-eval_interval = 300 
+batch_size = 16
+block_size = 64
+max_iters = 5000
+eval_interval = 500
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_iters = 200
-n_embed = 32
+eval_iters = 100
+n_head = 4
+n_layer = 3
+n_embed = 64
+dropout = 0.2
 torch.manual_seed(1337)
 
 #wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
@@ -73,6 +77,8 @@ class Head (nn.Module):
         self.value = nn.Linear(n_embed, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
             B, T, C = x.shape
             k = self.key(x)
@@ -81,6 +87,7 @@ class Head (nn.Module):
             wei = q @ k.transpose(-2, -1) * C**-0.5 #(B, T, C) x (B, C, T) -> (B, T, T)
             wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
             wei = F.softmax(wei, dim=-1)
+            wei = self.dropout(wei)
 
             v = self.value(x) #(B, T, C)
             out = wei @ v #(B, T, T) x (B, T, C) -> (B, T, C)
@@ -91,24 +98,44 @@ class MultipleHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embed, n_embed) #before we concatenate we optimize with Block using residual pathways
+        self.dropout = nn.Dropout(dropout)      #its becoming a pretty stretched out neural network so its efficiency is decreasing with current optimization mehtods.
+
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
+        return out
 
 #feeding each token embedding into a non linear layer for the models better understanding of each tokens relationships
 class Feed(nn.Module):
     def __init__(self, n_embed):
         super().__init__()
         self.net = nn.Sequential( ##sequential block to run operations in specific order
-            nn.Linear(n_embed, n_embed),
+            nn.Linear(n_embed,  4 * n_embed),
             nn.ReLU(),
+            nn.Linear(4 * n_embed, n_embed),
+            nn.Dropout(dropout)
         )
 
     def forward(self, x):
         return self.net(x)
 
 
+class Block(nn.Module):
+    #Transformer block: communication followed by computation
+    def __init__(self, n_embed, n_head): #n_embed: embedding dimension, n_head: the number of heads we'd like
+        super().__init__()
+        head_size = n_embed // n_head
+        self.sa = MultipleHeadAttention(n_head, head_size)
+        self.ff = Feed(n_embed)
+        self.layernorm = nn.LayerNorm(n_embed)
+        self.layernorm2 = nn.LayerNorm(n_embed)
 
+    def forward(self, x):
+        x = x + self.sa(self.layernorm(x))
+        x =x + self.ff(self.layernorm2(x))
+        return x
 
 class BigramLanguageModel(nn.Module):
 
@@ -116,8 +143,13 @@ class BigramLanguageModel(nn.Module):
     super().__init__()
     self.token_embedding_table = nn.Embedding(vocab_size, n_embed) #creates an embedding table full of raw scores correlating to the probability of a word. Each row is a word that has a corresponding vector to it
     self.position_embedding_table = nn.Embedding(block_size, n_embed)
-    self.attention_head = MultipleHeadAttention(4, n_embed//4) #we have 4 heads of 8 dimensional self attention
-    self.ff = Feed(n_embed)
+    self.blocks = nn.Sequential(
+        Block(n_embed, n_head=4),
+        Block(n_embed, n_head=4),
+        Block(n_embed, n_head=4),
+        nn.LayerNorm(n_embed),
+    )
+
     self.lm_head = nn.Linear(n_embed, vocab_size)
 
   def forward(self, idx, targets=None):
@@ -127,7 +159,7 @@ class BigramLanguageModel(nn.Module):
       token_emb = self.token_embedding_table(idx) #logits will correlate to the vector at the idx
       pos_emb = self.position_embedding_table(torch.arange(T, device=device)) #(T, C)
       x = token_emb + pos_emb
-      x = self.attention_head(x) #apply one head of self attention
+      x = self.blocks(x)
       logits = self.lm_head(x) #(B, T, vocab_size)
 
       if targets is None:
@@ -180,4 +212,4 @@ for iter in range(max_iters):
 print(loss.item())
 
 
-print(decoder(m.generate(torch.zeros((1,1), dtype=torch.long, device=device), max_new_tokens=100)[0].tolist()))
+print(decoder(m.generate(torch.zeros((1,1), dtype=torch.long, device=device), max_new_tokens=300)[0].tolist()))
